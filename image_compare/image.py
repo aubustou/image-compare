@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
-import random
+import zipfile
 from pathlib import Path
+from typing import TypedDict
 
 import chromadb  # Remplacez ceci par la bibliothèque client correcte pour ChromaDB
 import numpy as np
+import requests
 import torch
 from PIL import Image
 from torchvision import models, transforms
+
+from .wishlist import add_to_wishlist, get_series
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +23,10 @@ CHROMADB_PORT = 8000
 
 def extract_features(model, preprocess, image_path: Path) -> np.ndarray:
     # Charger l'image
-    image = Image.open(image_path).convert("RGB")
+    if image_path.suffix == ".zip":
+        image = open_zip_file(image_path)
+    else:
+        image = Image.open(image_path).convert("RGB")
     image = preprocess(image)
     image = image.unsqueeze(0)  # Ajouter une dimension de batch
 
@@ -32,9 +38,18 @@ def extract_features(model, preprocess, image_path: Path) -> np.ndarray:
     return features
 
 
+class SearchResults(TypedDict):
+    ids: list[list[str]]
+    distances: list[list[float]]
+    embeddings: list[list[float]]
+    metadata: list[list[str]]
+
+
 def search(
     image_path: Path, model, preprocess, collection: chromadb.Collection, k: int
-):
+) -> SearchResults:
+    logger.info("Searching for %s", image_path)
+
     # Extrait les caractéristiques de l'image cible dans A
     features_A = extract_features(model, preprocess, image_path)
 
@@ -42,8 +57,10 @@ def search(
         query_embeddings=features_A.numpy().tolist(),
         n_results=k,
     )
-    for id_ in results["ids"]:
+    for id_ in results["ids"][0]:
         logger.info("Found %s", id_[0])
+
+    return results
 
 
 def push_to_chromadb(collection, features_list):
@@ -55,7 +72,7 @@ def push_to_chromadb(collection, features_list):
 
 
 def get_features(model, preprocess, folder: Path, collection) -> None:
-    features_list = []
+    features_list: list[tuple[Path, torch.Tensor]] = []
 
     for index, filename in enumerate(folder.rglob("*.jpg")):
         if index % 100 == 0:
@@ -75,11 +92,27 @@ def get_features(model, preprocess, folder: Path, collection) -> None:
     push_to_chromadb(collection, features_list)
 
 
+def open_zip_file(zip_file: Path) -> Image.Image:
+    """Get the cover image from a zip file."""
+    with zipfile.ZipFile(zip_file) as z:
+        for filename in z.namelist():
+            if filename.endswith(".jpg"):
+                with z.open(filename) as f:
+                    return Image.open(f).convert("RGB")
+
+    raise ValueError("No image found in zip file")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "directory", type=Path, help="Directory containing images to be inserted"
     )
+    parser.add_argument(
+        "--generate", action="store_true", help="Generate features for images"
+    )
+    parser.add_argument("input", type=Path, help="Image to search for")
+    parser.add_argument("-k", type=int, help="Number of results to return", default=1)
 
     args = parser.parse_args()
 
@@ -87,6 +120,30 @@ def main():
 
     logging.basicConfig(level=logging.INFO)
 
+    model, preprocess = init_model()
+    collection = get_collection()
+
+    if args.generate:
+        get_features(model, preprocess, folder, collection)
+
+    results = execute_search(
+        model=model,
+        preprocess=preprocess,
+        collection=collection,
+        folder=folder,
+        image_path=args.input,
+        k=args.k,
+    )
+
+    bd_id = int(results["ids"][0][0].removesuffix(".jpg").zfill(6)[:3])
+
+    with requests.Session() as session:
+        add_to_wishlist(session, bd_id)
+        series_id = get_series(session, bd_id)
+        logger.info("Found series %s", series_id)
+
+
+def init_model():
     # Charger le modèle pré-entraîné (ResNet dans cet exemple)
     model = models.resnet50(pretrained=True)
     model.eval()
@@ -101,18 +158,37 @@ def main():
         ]
     )
 
+    return model, preprocess
+
+
+def get_collection(name: str = "bd-images") -> chromadb.Collection:
     # Configuration de la connexion à ChromaDB
     client = chromadb.HttpClient(host=CHROMADB_HOST, port=CHROMADB_PORT, ssl=False)
     try:
-        collection = client.create_collection("bd-images")
+        collection = client.create_collection(name)
     except Exception:
-        collection = client.get_collection("bd-images")
+        collection = client.get_collection(name)
 
-    get_features(model, preprocess, folder, collection)
+    return collection
 
-    # Recherche
-    image_path = random.choice(list(folder.rglob("*.jpg")))
-    search(image_path, model, preprocess, collection, 1)
+
+def execute_search(
+    model: torch.nn.Module,
+    preprocess: transforms.Compose,
+    collection: chromadb.Collection,
+    folder: Path,
+    image_path: Path,
+    k: int,
+):
+    results = search(image_path, model, preprocess, collection, k)
+
+    # Afficher les résultats
+    for index, id_ in enumerate(results["ids"][0]):
+        logger.info("Found %s", id_)
+        logger.info("Distance: %s", results["distances"][0][index])
+        Image.open(folder / id_.removesuffix(".jpg").zfill(6)[:3] / id_).show()
+
+    return results
 
 
 if __name__ == "__main__":
