@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import zipfile
 from pathlib import Path
 from typing import TypedDict
 
-import chromadb  # Remplacez ceci par la bibliothèque client correcte pour ChromaDB
+import chromadb
 import numpy as np
 import requests
 import torch
 from PIL import Image
 from torchvision import models, transforms
+
+from bedetheque_scraper.main import add_file_to_zip
+from bedetheque_scraper.scraper import get_album_info, get_albums
 
 from .wishlist import add_to_wishlist, get_series
 
@@ -103,6 +107,51 @@ def open_zip_file(zip_file: Path) -> Image.Image:
     raise ValueError("No image found in zip file")
 
 
+def login_to_bedetheque(session: requests.Session) -> None:
+    """Login to bedetheque.com."""
+    with Path("credentials.json").open() as f:
+        credentials = json.load(f)
+
+    data = {
+        "redirect": "https://www.bdgest.com/preview-4012-BD-la-guerre-des-amazones-recit-complet.html",
+        "autologin": 1,
+        "login": "Connexion",
+        "username": credentials["login"],
+        "password": credentials["password"],
+    }
+    response = session.post(
+        "https://www.bdgest.com/forum/ucp.php?mode=login", data=data
+    )
+    response.raise_for_status()
+
+    logger.info("Logged in bedetheque")
+
+
+def login_to_bdgest(session: requests.Session) -> None:
+    """Login to bedetheque.com."""
+    with Path("credentials.json").open() as f:
+        credentials = json.load(f)
+
+    breakpoint()
+
+    data = {
+        "csrf_token_bdg": session.cookies["csrf_cookie_bdg"],
+        "li1": "username",
+        "li2": "password",
+        "source": "",
+        "username": credentials["login"],
+        "password": credentials["password"],
+        "auto_connect": "on",
+    }
+    response = session.post(
+        "https://online.bdgest.com/login", data=data, headers=BDGEST_HEADERS
+    )
+
+    response.raise_for_status()
+
+    logger.info("Logged in bdgest")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -113,12 +162,28 @@ def main():
     )
     parser.add_argument("input", type=Path, help="Image to search for")
     parser.add_argument("-k", type=int, help="Number of results to return", default=1)
+    parser.add_argument(
+        "--distance-cutoff",
+        type=int,
+        help="Maximum distance between image and result",
+        default=2000,
+    )
+    parser.add_argument("--show", action="store_true", help="Show results in a window")
+    parser.add_argument("--recursive", action="store_true", help="Search recursively")
 
     args = parser.parse_args()
 
-    folder = args.directory
-
     logging.basicConfig(level=logging.INFO)
+
+    folder = args.directory
+    distance_cutoff = args.distance_cutoff
+
+    if (inputs := args.input).is_file():
+        input_files = [inputs]
+    elif args.recursive:
+        input_files = list(inputs.rglob("*.zip"))
+    else:
+        input_files = list(inputs.glob("*.zip"))
 
     model, preprocess = init_model()
     collection = get_collection()
@@ -126,21 +191,67 @@ def main():
     if args.generate:
         get_features(model, preprocess, folder, collection)
 
+    for input_file in input_files:
+        try:
+            do(
+                input_file=input_file,
+                model=model,
+                preprocess=preprocess,
+                collection=collection,
+                folder=folder,
+                k=args.k,
+                distance_cutoff=distance_cutoff,
+                show=args.show,
+            )
+        except Exception as e:
+            logger.error("Error while processing %s: %s", input_file, e)
+            continue
+
+
+def do(
+    input_file: Path,
+    model: torch.nn.Module,
+    preprocess: transforms.Compose,
+    collection: chromadb.Collection,
+    folder: Path,
+    k: int,
+    distance_cutoff: int,
+    show: bool = False,
+):
     results = execute_search(
         model=model,
         preprocess=preprocess,
         collection=collection,
         folder=folder,
-        image_path=args.input,
-        k=args.k,
+        image_path=input_file,
+        k=k,
+        distance_cutoff=distance_cutoff,
+        show=show,
     )
 
-    bd_id = int(results["ids"][0][0].removesuffix(".jpg").zfill(6)[:3])
+    if not results:
+        logger.warning("No results found for %s", input_file)
+        return
+
+    bd_id = int(results[0]["id"].removesuffix(".jpg").zfill(6))
+    logger.info("Found BD %s", bd_id)
 
     with requests.Session() as session:
+        # session.headers = BDGEST_HEADERS
+        # login_to_bedetheque(session)
+        # login_to_bdgest(session)
+
         add_to_wishlist(session, bd_id)
-        series_id = get_series(session, bd_id)
-        logger.info("Found series %s", series_id)
+        series = get_series(session, bd_id)
+        logger.info("Found BD %s from series %s", bd_id, series)
+
+        albums = get_albums(series, session, bd_id)
+        logger.info("Found albums %s", albums)
+        for album in albums:
+            if infos := get_album_info(album, session):
+                logger.info("Found info %s", infos)
+
+        add_file_to_zip(input_file, album, overwrite=True)
 
 
 def init_model():
@@ -172,6 +283,13 @@ def get_collection(name: str = "bd-images") -> chromadb.Collection:
     return collection
 
 
+class EndResult(TypedDict):
+    id: str
+    distance: float
+    embedding: list[float] | None
+    metadata: str | None
+
+
 def execute_search(
     model: torch.nn.Module,
     preprocess: transforms.Compose,
@@ -179,16 +297,37 @@ def execute_search(
     folder: Path,
     image_path: Path,
     k: int,
-):
+    distance_cutoff: int,
+    show: bool = False,
+) -> list[EndResult]:
     results = search(image_path, model, preprocess, collection, k)
 
     # Afficher les résultats
+    end_results = []
+
     for index, id_ in enumerate(results["ids"][0]):
         logger.info("Found %s", id_)
         logger.info("Distance: %s", results["distances"][0][index])
-        Image.open(folder / id_.removesuffix(".jpg").zfill(6)[:3] / id_).show()
+        if results["distances"][0][index] > distance_cutoff:
+            logger.warning("Distance too high, skipping")
+            continue
+        end_results.append(
+            EndResult(
+                id=id_,
+                distance=results["distances"][0][index],
+                embedding=results["embeddings"][0][index]
+                if results["embeddings"]
+                else None,
+                metadata=results["metadata"][0][index]
+                if results.get("metadata")
+                else None,
+            )
+        )
 
-    return results
+        if show:
+            Image.open(folder / id_.removesuffix(".jpg").zfill(6)[:3] / id_).show()
+
+    return end_results
 
 
 if __name__ == "__main__":
